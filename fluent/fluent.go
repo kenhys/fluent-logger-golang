@@ -9,6 +9,7 @@ import (
 	"os"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -91,11 +92,12 @@ type Fluent struct {
 	wg          sync.WaitGroup
 
 	muconn sync.Mutex
-	conn   net.Conn
+	conn   []net.Conn
 }
 
 // New creates a new Logger.
 func New(config Config) (*Fluent, error) {
+	rand.Seed(time.Now().UnixNano())
 	if config.Timeout == 0 {
 		config.Timeout = defaultTimeout
 	}
@@ -141,12 +143,19 @@ func newWithDialer(config Config, d dialer) (f *Fluent, err error) {
 		config.Async = config.Async || config.AsyncConnect
 	}
 
+	if strings.Contains(config.FluentHost, ",") {
+		config.Async = true
+		config.BufferLimit = 1024 * 1000
+	}
 	if config.Async {
 		f = &Fluent{
-			Config:  config,
-			dialer:  d,
-			pending: make(chan *msgToSend, config.BufferLimit),
+			Config:      config,
+			dialer:      d,
+			pending:     make(chan *msgToSend, config.BufferLimit),
 			stopRunning: make(chan bool, 1),
+		}
+		if strings.Contains(config.FluentHost, ",") {
+			err = f.connect()
 		}
 		f.wg.Add(1)
 		go f.run()
@@ -347,26 +356,65 @@ func (f *Fluent) appendBuffer(msg *msgToSend) error {
 }
 
 // close closes the connection.
-func (f *Fluent) close(c net.Conn) {
+func (f *Fluent) close(c []net.Conn) {
 	f.muconn.Lock()
-	if f.conn != nil && f.conn == c {
-		f.conn.Close()
+	if f.conn != nil && reflect.DeepEqual(f.conn, c) {
+		for _, v := range f.conn {
+			v.Close()
+		}
 		f.conn = nil
+	}
+	f.muconn.Unlock()
+}
+
+func (f *Fluent) closeOne(c net.Conn) {
+	f.muconn.Lock()
+	if f.conn != nil {
+		var index = -1
+		for i, v := range f.conn {
+			if v == c {
+				index = i
+				break
+			}
+		}
+		if index >= 0 {
+			f.conn[index].Close()
+			f.conn[len(f.conn)-1], f.conn[index] = f.conn[index], f.conn[len(f.conn)-1]
+			f.conn = f.conn[:len(f.conn)-1]
+		}
 	}
 	f.muconn.Unlock()
 }
 
 // connect establishes a new connection using the specified transport.
 func (f *Fluent) connect() (err error) {
+	var c net.Conn
 	switch f.Config.FluentNetwork {
 	case "tcp":
-		f.conn, err = f.dialer.Dial(
-			f.Config.FluentNetwork,
-			f.Config.FluentHost+":"+strconv.Itoa(f.Config.FluentPort))
+		if strings.Contains(f.Config.FluentHost, ",") {
+			for _, v := range strings.Split(f.Config.FluentHost, ",") {
+				if strings.Contains(v, ":") {
+					c, err = f.dialer.Dial(
+						f.Config.FluentNetwork, v)
+					f.conn = append(f.conn, c)
+				} else {
+					c, err = f.dialer.Dial(
+						f.Config.FluentNetwork,
+						v+":"+strconv.Itoa(f.Config.FluentPort))
+					f.conn = append(f.conn, c)
+				}
+			}
+		} else {
+			c, err = f.dialer.Dial(
+				f.Config.FluentNetwork,
+				f.Config.FluentHost+":"+strconv.Itoa(f.Config.FluentPort))
+			f.conn = append(f.conn, c)
+		}
 	case "unix":
-		f.conn, err = f.dialer.Dial(
+		c, err = f.dialer.Dial(
 			f.Config.FluentNetwork,
 			f.Config.FluentSocketPath)
+		f.conn = append(f.conn, c)
 	default:
 		err = NewErrUnknownNetwork(f.Config.FluentNetwork)
 	}
@@ -408,8 +456,15 @@ func e(x, y float64) int {
 
 func (f *Fluent) write(msg *msgToSend) error {
 	var c net.Conn
+	var index int
 	for i := 0; i < f.Config.MaxRetry; i++ {
-		c = f.conn
+		if f.conn != nil {
+			if len(f.conn) > 0 {
+				index = rand.Intn(len(f.conn))
+				c = f.conn[index]
+				fmt.Printf("%d\n", index)
+			}
+		}
 		// Connect if needed
 		if c == nil {
 			f.muconn.Lock()
@@ -430,7 +485,8 @@ func (f *Fluent) write(msg *msgToSend) error {
 					continue
 				}
 			}
-			c = f.conn
+			index = rand.Intn(len(f.conn))
+			c = f.conn[index]
 			f.muconn.Unlock()
 		}
 
@@ -443,7 +499,7 @@ func (f *Fluent) write(msg *msgToSend) error {
 		}
 		_, err := c.Write(msg.data)
 		if err != nil {
-			f.close(c)
+			f.closeOne(c)
 		} else {
 			// Acknowledgment check
 			if msg.ack != "" {
@@ -456,7 +512,7 @@ func (f *Fluent) write(msg *msgToSend) error {
 					err = resp.DecodeMsg(r)
 				}
 				if err != nil || resp.Ack != msg.ack {
-					f.close(c)
+					f.closeOne(c)
 					continue
 				}
 			}

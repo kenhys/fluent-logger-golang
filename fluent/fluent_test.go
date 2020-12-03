@@ -325,7 +325,7 @@ func Test_SubSecondPrecision(t *testing.T) {
 			SubSecondPrecision: true,
 		},
 	}
-	fluent.conn = &Conn{}
+	fluent.conn = append(fluent.conn, &Conn{})
 
 	// Exercise the test subject
 	timestamp := time.Unix(1267867237, 256)
